@@ -19,7 +19,7 @@ if [[ $has_cv -eq 0 || $has_i -eq 0 || $has_real_file -eq 0 ]]; then
 fi
 
 # -------- Init --------
-argv=("$@")   # safe array of args
+argv=("$@")
 args=()
 use_nvenc=0
 nvenc_selected=0
@@ -129,10 +129,13 @@ case "$PROFILE" in
     echo "[$(ts)] INFO: Samsung profile detected" >> "$LOG_FILE"
     samsung_mp4_safe=0
     for ((i=0;i<${#args[@]};i++)); do
-      if [[ "${args[$i]}" == "-f" && "${args[$((i+1))]}" == "mp4" ]]; then
-        echo "[$(ts)] INFO: Forcing +faststart MP4 for seeking" >> "$LOG_FILE"
-        args+=( -movflags +faststart -avoid_negative_ts make_zero )
-        samsung_mp4_safe=1
+      if [[ "${args[$i]}" == "-f" ]]; then
+        fmt="${args[$((i+1))]}"
+        if [[ "$fmt" == "mp4" ]]; then
+          echo "[$(ts)] INFO: Forcing +faststart MP4 for seeking" >> "$LOG_FILE"
+          args+=( -movflags +faststart -avoid_negative_ts make_zero )
+          samsung_mp4_safe=1
+        fi
       fi
     done
     if [[ $samsung_mp4_safe -eq 0 ]]; then
@@ -161,7 +164,13 @@ esac
 # -------- Audio Normalization Fix --------
 if [[ "$PROFILE" == samsung_mu6172_nvenc || "$PROFILE" == samsung_force_nvenc ]]; then
   echo "[$(ts)] INFO: Forcing AAC → MP3 48kHz stereo for Samsung" >> "$LOG_FILE"
-  args=( "${args[@]}" -c:a mp3 -ar 48000 -ac 2 -b:a 192k )
+  rebuilt=(); skip=0
+  for ((i=0;i<${#args[@]};i++)); do
+    if [[ "${args[$i]}" == "-c:a" ]]; then skip=1; continue; fi
+    if [[ $skip -eq 1 ]]; then skip=0; continue; fi
+    rebuilt+=( "${args[$i]}" )
+  done
+  args=( "${rebuilt[@]}" -c:a mp3 -ar 48000 -ac 2 -b:a 192k )
 fi
 
 echo "[$(ts)] DEBUG: Final args=${args[*]}" >> "$LOG_FILE"

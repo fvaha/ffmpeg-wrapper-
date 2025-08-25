@@ -1,0 +1,210 @@
+#!/bin/bash
+FFMPEG_BIN="/opt/serviio/ffmpeg-build/workspace/bin/ffmpeg"
+LOG_DIR="/opt/serviio/log"
+LOG_FILE="$LOG_DIR/ffmpeg-wrapper.log"
+mkdir -p "$LOG_DIR"
+
+ts(){ date +"%Y-%m-%d %H:%M:%S"; }
+
+# -------- Detect real transcode --------
+has_real_file=0
+for a in "$@"; do [[ -f "$a" ]] && { has_real_file=1; break; }; done
+
+has_cv=0; has_i=0
+for a in "$@"; do [[ "$a" == "-c:v" ]] && has_cv=1; [[ "$a" == "-i" ]] && has_i=1; done
+
+if [[ $has_cv -eq 0 || $has_i -eq 0 || $has_real_file -eq 0 ]]; then
+  echo "[$(ts)] INFO: Passthrough (probe/non-transcode): $*" >> "$LOG_FILE"
+  exec "$FFMPEG_BIN" "$@"
+fi
+
+# -------- Init --------
+argv=("$@")   # safe array of args
+args=()
+use_nvenc=0
+nvenc_selected=0
+codec_used=""
+
+PROFILE="${SERVIIO_CLIENT_PROFILE:-unknown}"
+echo "[$(ts)] INFO: Using profile=$PROFILE" >> "$LOG_FILE"
+
+# First input file for subs
+input_file=""
+for a in "$@"; do [[ -f "$a" ]] && { input_file="$a"; break; }; done
+base="${input_file%.*}"
+
+# Thumbnail detection
+thumbnail_mode=0
+for ((i=0;i<${#argv[@]};i++)); do
+  if [[ "${argv[$i]}" == "-frames:v" || "${argv[$i]}" == "-update" ]]; then thumbnail_mode=1; break; fi
+  if [[ "${argv[$i]}" == "-f" && $((i+1)) -lt ${#argv[@]} && "${argv[$((i+1))]}" == "image2" ]]; then thumbnail_mode=1; break; fi
+done
+
+# Sidecar SRT
+srt_file=""; have_srt=0
+if [[ $thumbnail_mode -eq 0 && -n "$input_file" ]]; then
+  if   [[ -f "${base}.srt"    ]]; then srt_file="${base}.srt";    have_srt=1
+  elif [[ -f "${base}.en.srt" ]]; then srt_file="${base}.en.srt"; have_srt=1
+  else
+    lang_srt=$(ls "${base}".*.srt 2>/dev/null | head -n 1)
+    [[ -n "$lang_srt" ]] && { srt_file="$lang_srt"; have_srt=1; }
+  fi
+fi
+
+echo "[$(ts)] RAW args: ${argv[*]}" >> "$LOG_FILE"
+
+# -------- Argument rewriter --------
+i=0
+while (( i < ${#argv[@]} )); do
+  case "${argv[$i]}" in
+    -c:v) args+=("${argv[$i]}"); use_nvenc=1; ((i++)) ;;
+
+    h264|libx264|mpeg2video|hevc|av1)
+      if [[ $use_nvenc -eq 1 ]]; then
+        if [[ "${argv[$i]}" == "hevc" ]]; then
+          args+=("hevc_nvenc"); codec_used="hevc_nvenc"
+        else
+          args+=("h264_nvenc"); codec_used="h264_nvenc"
+        fi
+        nvenc_selected=1; use_nvenc=0
+        args+=( -preset p4 -rc vbr -tune hq -multipass full \
+                -b:v 8000k -maxrate 12000k -bufsize 16000k \
+                -profile:v high -level 4.1 -g 48 -bf 2 \
+                -mpegts_flags +resend_headers -pix_fmt yuv420p )
+      else
+        args+=("${argv[$i]}")
+      fi
+      ;;
+
+    -vf|-filter_complex|-filter_complex_script)
+      if [[ -n "${argv[$((i+1))]:-}" && "${argv[$((i+1))]}" == *"subtitles="* ]]; then
+        echo "[$(ts)] INFO: Stripped Serviio filter (${argv[$i]} ${argv[$((i+1))]})" >> "$LOG_FILE"
+        ((i++))
+      else
+        args+=("${argv[$i]}")
+      fi
+      ;;
+
+    *subtitles=*) echo "[$(ts)] INFO: Stripped inline filter (${argv[$i]})" >> "$LOG_FILE" ;;
+
+    -map)
+      if [[ -n "${argv[$((i+1))]:-}" && "${argv[$((i+1))]}" == "[v]" ]]; then
+        echo "[$(ts)] INFO: Replacing invalid -map [v] → -map 0:v:0" >> "$LOG_FILE"
+        args+=( -map 0:v:0 )
+        ((i++))
+      else
+        args+=("${argv[$i]}")
+        [[ -n "${argv[$((i+1))]:-}" ]] && { args+=("${argv[$((i+1))]}"); ((i++)); }
+      fi
+      ;;
+
+    -qscale:v)
+      if [[ $nvenc_selected -eq 1 ]]; then
+        echo "[$(ts)] INFO: Stripped qscale (incompatible with NVENC)" >> "$LOG_FILE"
+        ((i++))
+      else
+        args+=("${argv[$i]}" "${argv[$((i+1))]}")
+        ((i++))
+      fi
+      ;;
+
+    -movflags)
+      echo "[$(ts)] INFO: Stripped movflags (frag_keyframe, dash, etc.)" >> "$LOG_FILE"
+      ((i++)) ;;
+
+    *) args+=("${argv[$i]}") ;;
+  esac
+  ((i++))
+done
+
+# Add safe defaults
+have_map=0
+for t in "${args[@]}"; do [[ "$t" == "-map" ]] && have_map=1; done
+[[ $have_map -eq 0 ]] && args+=( -map 0:v:0 -map 0:a:0 )
+args+=( -max_muxing_queue_size 4096 )
+
+# -------- Profile-specific fixes --------
+case "$PROFILE" in
+  samsung_mu6172_nvenc|samsung_force_nvenc)
+    echo "[$(ts)] INFO: Samsung profile detected" >> "$LOG_FILE"
+    samsung_mp4_safe=0
+    for ((i=0;i<${#args[@]};i++)); do
+      if [[ "${args[$i]}" == "-f" && "${args[$((i+1))]}" == "mp4" ]]; then
+        echo "[$(ts)] INFO: Forcing +faststart MP4 for seeking" >> "$LOG_FILE"
+        args+=( -movflags +faststart -avoid_negative_ts make_zero )
+        samsung_mp4_safe=1
+      fi
+    done
+    if [[ $samsung_mp4_safe -eq 0 ]]; then
+      echo "[$(ts)] INFO: Enforcing MPEGTS container (safe fallback)" >> "$LOG_FILE"
+      for ((i=0;i<${#args[@]};i++)); do
+        if [[ "${args[$i]}" == "-f" && ( "${args[$((i+1))]}" == "vob" || "${args[$((i+1))]}" == "mp4" ) ]]; then
+          args[$((i+1))]="mpegts"
+        fi
+      done
+      args+=( -g 48 -keyint_min 48 -sc_threshold 0 )
+    fi
+    ;;
+
+  sharp_aquos_android)
+    echo "[$(ts)] INFO: Sharp Aquos Android detected → minimizing transcoding" >> "$LOG_FILE"
+    ;;
+
+  *)
+    if [[ "$input_file" == *.mp4 ]]; then
+      echo "[$(ts)] INFO: Adding +faststart for MP4 seeking" >> "$LOG_FILE"
+      args+=( -movflags +faststart -avoid_negative_ts make_zero )
+    fi
+    ;;
+esac
+
+# -------- Audio Normalization Fix --------
+if [[ "$PROFILE" == samsung_mu6172_nvenc || "$PROFILE" == samsung_force_nvenc ]]; then
+  echo "[$(ts)] INFO: Forcing AAC → MP3 48kHz stereo for Samsung" >> "$LOG_FILE"
+  args=( "${args[@]}" -c:a mp3 -ar 48000 -ac 2 -b:a 192k )
+fi
+
+echo "[$(ts)] DEBUG: Final args=${args[*]}" >> "$LOG_FILE"
+
+# -------- Execute --------
+[[ $thumbnail_mode -eq 1 ]] && { echo "[$(ts)] INFO: Thumbnail job → no subs" >> "$LOG_FILE"; exec "$FFMPEG_BIN" "${args[@]}"; }
+
+[[ $have_srt -eq 1 ]] && echo "[$(ts)] INFO: Sidecar SRT found: $srt_file" >> "$LOG_FILE"
+
+"$FFMPEG_BIN" "${args[@]}"; status=$?
+
+# NVENC retry → libx264 fallback
+if [[ $status -ne 0 && "$codec_used" == *nvenc* ]]; then
+  echo "[$(ts)] WARN: NVENC failed, retrying with -rc vbr" >> "$LOG_FILE"
+  rebuilt=(); for a in "${args[@]}"; do [[ "$a" == "vbr_hq" ]] && rebuilt+=( vbr ) || rebuilt+=( "$a" ); done
+  "$FFMPEG_BIN" "${rebuilt[@]}"; status=$?; args=( "${rebuilt[@]}" )
+fi
+if [[ $status -ne 0 && "$codec_used" == *nvenc* ]]; then
+  echo "[$(ts)] WARN: NVENC still failing → fallback to libx264 (superfast)" >> "$LOG_FILE"
+  rebuilt=(); skip=0
+  for a in "${args[@]}"; do
+    if [[ $skip -eq 1 ]]; then skip=0; continue; fi
+    case "$a" in
+      h264_nvenc|hevc_nvenc) rebuilt+=( libx264 ) ;;
+      -rc) skip=1 ;;
+      -preset) rebuilt+=( -preset superfast ); skip=1 ;;
+      *) rebuilt+=( "$a" ) ;;
+    esac
+  done
+  "$FFMPEG_BIN" "${rebuilt[@]}"; status=$?; args=( "${rebuilt[@]}" )
+fi
+
+# Hardsub fallback
+if [[ $status -ne 0 && $have_srt -eq 1 ]]; then
+  ff_srt="$srt_file"
+  ff_srt="${ff_srt//\\/\\\\}"; ff_srt="${ff_srt//:/\\:}"
+  ff_srt="${ff_srt//[/\\[}";  ff_srt="${ff_srt//]/\\]}"
+  ff_srt="${ff_srt//\'/\\\'}"
+  echo "[$(ts)] WARN: Retry with hardsub: $ff_srt" >> "$LOG_FILE"
+  rebuilt=( "${args[@]}" -vf "subtitles=$ff_srt" )
+  exec "$FFMPEG_BIN" "${rebuilt[@]}"
+fi
+
+[[ $status -eq 0 ]] && echo "[$(ts)] SUCCESS: codec=$codec_used" >> "$LOG_FILE" \
+                    || echo "[$(ts)] FAIL: codec=$codec_used" >> "$LOG_FILE"
+exit $status
